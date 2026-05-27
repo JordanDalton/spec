@@ -39,6 +39,10 @@ pub struct Message {
     pub message_type: MessageType,
     pub proposal: Option<SemanticProposal>,
     pub reasoning: String,
+    #[serde(default)]
+    pub context: Option<String>,
+    #[serde(default)]
+    pub knowledge: Option<String>,
     pub timestamp: u64,
     pub session_id: String,
 }
@@ -60,6 +64,8 @@ impl Message {
             message_type,
             proposal,
             reasoning,
+            context: None,
+            knowledge: None,
             timestamp,
             session_id,
         }
@@ -74,6 +80,8 @@ pub struct Session {
     pub locked: bool,
     pub agreed_agents: Vec<String>,
     pub created_at: u64,
+    #[serde(default)]
+    pub solo: bool,
 }
 
 impl Session {
@@ -90,6 +98,7 @@ impl Session {
             locked: false,
             agreed_agents: Vec::new(),
             created_at,
+            solo: false,
         }
     }
 
@@ -169,6 +178,54 @@ pub fn session_path_for(spec_file: &str) -> PathBuf {
     Path::new(".spec").join("sessions").join(session_file)
 }
 
+/// Archive a session file by renaming it to the next available versioned path.
+/// e.g. `HomeController.php.json` → `HomeController.php.1.json`
+/// Called before resetting a locked session to preserve the history.
+pub fn archive_session(spec_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = session_path_for(spec_file);
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut version = 1u32;
+    loop {
+        // Replace the `.json` extension with `.<version>.json`
+        let archive_path = path.with_extension(format!("{}.json", version));
+        if !archive_path.exists() {
+            std::fs::rename(&path, &archive_path)?;
+            return Ok(());
+        }
+        version += 1;
+        if version > 9999 {
+            return Err("Too many archived sessions for this spec file.".into());
+        }
+    }
+}
+
+/// Delete the active session and all archived versions for a spec file.
+pub fn reset_session(spec_file: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let path = session_path_for(spec_file);
+    let mut removed = 0;
+
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        removed += 1;
+    }
+
+    let mut version = 1u32;
+    loop {
+        let archive = path.with_extension(format!("{}.json", version));
+        if archive.exists() {
+            std::fs::remove_file(&archive)?;
+            removed += 1;
+            version += 1;
+        } else {
+            break;
+        }
+    }
+
+    Ok(removed)
+}
+
 pub fn load_session(spec_file: &str) -> Result<Option<Session>, Box<dyn std::error::Error>> {
     let path = session_path_for(spec_file);
     if !path.exists() {
@@ -185,8 +242,62 @@ pub fn save_session(session: &Session) -> Result<(), Box<dyn std::error::Error>>
         std::fs::create_dir_all(parent)?;
     }
     let content = serde_json::to_string_pretty(session)?;
-    std::fs::write(&path, content)?;
+    // Atomic write: write to .tmp then rename so concurrent readers never see a partial file
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &content)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+pub fn with_session_lock<F, T>(spec_file: &str, f: F) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: FnOnce(&mut Session) -> Result<T, Box<dyn std::error::Error>>,
+{
+    let session_path = session_path_for(spec_file);
+    if let Some(parent) = session_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = session_path.with_extension("lock");
+
+    // Spin-wait for the lock file (simple advisory lock — no flock needed)
+    let lock_file = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(f) => break f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Check for stale lock (older than 30s)
+                if let Ok(meta) = std::fs::metadata(&lock_path) {
+                    if let Ok(modified) = meta.modified() {
+                        if modified.elapsed().unwrap_or_default().as_secs() > 30 {
+                            let _ = std::fs::remove_file(&lock_path);
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    // Re-read the session while holding the lock so we have the latest state
+    let mut session = match load_session(spec_file)? {
+        Some(s) => s,
+        None => Session::new(spec_file),
+    };
+
+    let result = f(&mut session);
+
+    if result.is_ok() {
+        save_session(&session)?;
+    }
+
+    drop(lock_file);
+    let _ = std::fs::remove_file(&lock_path);
+
+    result
 }
 
 pub fn load_or_create_session(spec_file: &str) -> Result<Session, Box<dyn std::error::Error>> {

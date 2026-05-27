@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "name": "spec-agent",
+      "path": "skills/spec-agent/SKILL.md",
+      "description": "Plays the agent role in a spec consensus session using the `spec` CLI."
+    },
+    {
+      "name": "spec-proposer",
+      "path": "skills/spec-proposer/SKILL.md",
+      "description": "Proposes high-quality, verifiable specs with guardrails so the implementation matches expectations."
+    },
+    {
+      "name": "spec-mediator",
+      "path": "skills/spec-mediator/SKILL.md",
+      "description": "Plays the mediator role to clarify/reframe stuck spec consensus sessions."
+    },
+    {
+      "name": "spec-implementer",
+      "path": "skills/spec-implementer/SKILL.md",
+      "description": "Plays the implementer role — build/test/release from a locked spec."
+    }
+  ]
+}

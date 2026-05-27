@@ -19,9 +19,19 @@ fn format_session_history(session: &Session) -> String {
                 .as_ref()
                 .map(|p| format!("\n  Proposal: {}", p.content))
                 .unwrap_or_default();
+            let knowledge_text = m
+                .knowledge
+                .as_ref()
+                .map(|k| format!("\n  Knowledge: {}", k))
+                .unwrap_or_default();
+            let context_text = m
+                .context
+                .as_ref()
+                .map(|c| format!("\n  Context: {}", c))
+                .unwrap_or_default();
             format!(
-                "[{}] {} | {}{}\n  Reasoning: {}",
-                m.timestamp, m.agent_id, m.message_type, proposal_text, m.reasoning
+                "[{}] {} | {}{}{}{}\n  Reasoning: {}",
+                m.timestamp, m.agent_id, m.message_type, knowledge_text, context_text, proposal_text, m.reasoning
             )
         })
         .collect::<Vec<_>>()
@@ -37,10 +47,13 @@ pub fn clarify(
     println!("Mediator [{}] clarifying: {}", mediator_id, file);
 
     let spec_state = read_spec(file)?;
-    let mut session = crate::session::load_or_create_session(file)?;
+    let session_snapshot = crate::session::load_or_create_session(file)?;
 
-    if session.messages.is_empty() {
+    if session_snapshot.messages.is_empty() {
         return Err("No session messages to clarify. Run 'spec propose' and 'spec respond' first.".into());
+    }
+    if session_snapshot.participating_agent_count() < 2 {
+        return Err("Mediation requires at least 2 agents to have participated. There is no disagreement to clarify yet.".into());
     }
 
     let prompt = format!(
@@ -77,37 +90,34 @@ REASONING:
         } else {
             spec_state.content.clone()
         },
-        format_session_history(&session),
+        format_session_history(&session_snapshot),
     );
 
     println!("Querying LLM for clarification...");
     let response = provider.complete(&prompt)?;
 
-    // Extract the clarification content
     let clarification_content = response.trim().to_string();
     let reasoning = extract_reasoning(&response);
-
-    let proposal = SemanticProposal {
-        content: clarification_content.clone(),
-        spec_hash: None, // Mediator doesn't propose spec content
-    };
-
-    let msg = Message::new(
-        mediator_id.clone(),
-        MessageType::Clarify,
-        Some(proposal),
-        reasoning,
-        session.session_id.clone(),
-    );
 
     println!("\n=== CLARIFICATION by {} ===", mediator_id);
     println!("{}", clarification_content);
 
-    session.add_message(msg);
-    crate::session::save_session(&session)?;
-
-    println!("\nClarification recorded in session: {}", session.session_id);
-    Ok(())
+    crate::session::with_session_lock(file, |session| {
+        let proposal = SemanticProposal {
+            content: clarification_content.clone(),
+            spec_hash: None,
+        };
+        let msg = Message::new(
+            mediator_id.clone(),
+            MessageType::Clarify,
+            Some(proposal),
+            reasoning.clone(),
+            session.session_id.clone(),
+        );
+        session.add_message(msg);
+        println!("\nClarification recorded in session: {}", session.session_id);
+        Ok(())
+    })
 }
 
 /// `spec reframe <file>` — mediator reframes the disagreement
@@ -119,10 +129,13 @@ pub fn reframe(
     println!("Mediator [{}] reframing: {}", mediator_id, file);
 
     let spec_state = read_spec(file)?;
-    let mut session = crate::session::load_or_create_session(file)?;
+    let session_snapshot = crate::session::load_or_create_session(file)?;
 
-    if session.messages.is_empty() {
+    if session_snapshot.messages.is_empty() {
         return Err("No session messages to reframe. Run 'spec propose' and 'spec respond' first.".into());
+    }
+    if session_snapshot.participating_agent_count() < 2 {
+        return Err("Mediation requires at least 2 agents to have participated. There is no disagreement to reframe yet.".into());
     }
 
     let prompt = format!(
@@ -163,7 +176,7 @@ REASONING:
         } else {
             spec_state.content.clone()
         },
-        format_session_history(&session),
+        format_session_history(&session_snapshot),
     );
 
     println!("Querying LLM for reframe...");
@@ -172,27 +185,25 @@ REASONING:
     let reframe_content = response.trim().to_string();
     let reasoning = extract_reasoning(&response);
 
-    let proposal = SemanticProposal {
-        content: reframe_content.clone(),
-        spec_hash: None, // Mediator doesn't propose spec content
-    };
-
-    let msg = Message::new(
-        mediator_id.clone(),
-        MessageType::Reframe,
-        Some(proposal),
-        reasoning,
-        session.session_id.clone(),
-    );
-
     println!("\n=== REFRAME by {} ===", mediator_id);
     println!("{}", reframe_content);
 
-    session.add_message(msg);
-    crate::session::save_session(&session)?;
-
-    println!("\nReframe recorded in session: {}", session.session_id);
-    Ok(())
+    crate::session::with_session_lock(file, |session| {
+        let proposal = SemanticProposal {
+            content: reframe_content.clone(),
+            spec_hash: None,
+        };
+        let msg = Message::new(
+            mediator_id.clone(),
+            MessageType::Reframe,
+            Some(proposal),
+            reasoning.clone(),
+            session.session_id.clone(),
+        );
+        session.add_message(msg);
+        println!("\nReframe recorded in session: {}", session.session_id);
+        Ok(())
+    })
 }
 
 fn extract_reasoning(text: &str) -> String {

@@ -101,37 +101,22 @@ pub fn build(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Implementer building: {}", file);
 
-    // Load session using the same key propose/agree use (the original file path)
-    let mut session = load_or_create_session(file)?;
-
-    // Derive spec file path for reading spec state
+    // Derive spec file path
     let spec_file = if file.ends_with(".spec") {
         file.to_string()
     } else {
         format!("{}.spec", file)
     };
 
-    // Enforce: all agents must have agreed
-    if !session.locked {
-        if !session.all_agents_agreed() {
-            let agreed = session.agreed_agents.len();
-            let total = session.agents_involved().len();
-            return Err(format!(
-                "Cannot build: consensus not reached. {}/{} agents have agreed. \
-                 All agents must run 'spec agree' before building.",
-                agreed, total
-            )
-            .into());
-        }
-        // Lock the session if it wasn't already
-        session.lock();
-    }
-
-    // Read agreed spec state
+    // Read the agreed spec — the .spec file is written at consensus and is the
+    // source of truth for build. This allows parallel workflows: an implementer
+    // can build from the last locked spec while a new discussion is in progress.
     let spec_state = read_spec(&spec_file)?;
 
     if spec_state.content.is_empty() {
-        return Err("Spec content is empty. Cannot build from an empty spec.".into());
+        return Err(
+            "No agreed spec found. Reach consensus with 'spec agree' before building.".into(),
+        );
     }
 
     let base_path = source_file_for(&spec_file);
@@ -185,25 +170,27 @@ FILENAME: <filename.ext>
     println!("File: {}", source_file);
     println!("Lines: {}", code.lines().count());
 
-    // Record the build in the session
-    let build_msg = Message::new(
-        "implementer".to_string(),
-        MessageType::Build,
-        Some(SemanticProposal {
-            content: format!("Built {} ({} lines)", source_file, code.lines().count()),
-            spec_hash: None,
-        }),
-        format!("Generated implementation from agreed spec"),
-        session.session_id.clone(),
-    );
-    session.add_message(build_msg);
-    crate::session::save_session(&session)?;
+    // Record the build event in whichever session is currently active
+    let session_id = crate::session::with_session_lock(file, |session| {
+        let build_msg = Message::new(
+            "implementer".to_string(),
+            MessageType::Build,
+            Some(SemanticProposal {
+                content: format!("Built {} ({} lines)", source_file, code.lines().count()),
+                spec_hash: None,
+            }),
+            "Generated implementation from agreed spec".to_string(),
+            session.session_id.clone(),
+        );
+        session.add_message(build_msg);
+        Ok(session.session_id.clone())
+    })?;
 
     println!("\nBuild complete. Source written to: {}", source_file);
 
     run_hook("post-build", &HookContext {
         spec_file: file.to_string(),
-        session_id: Some(session.session_id.clone()),
+        session_id: Some(session_id),
         env_target: None,
     })?;
     Ok(())
@@ -238,7 +225,14 @@ pub fn test(file: &str) -> Result<(), Box<dyn std::error::Error>> {
         "ts" | "tsx" | "js" | "jsx" => ("npm", vec!["test"]),
         "go" => ("go", vec!["test", "./..."]),
         "rb" => ("bundle", vec!["exec", "rspec"]),
-        "php" => ("./vendor/bin/phpunit", vec![]),
+        "php" => {
+            // Prefer Pest if installed, fall back to PHPUnit
+            if Path::new("./vendor/bin/pest").exists() {
+                ("./vendor/bin/pest", vec![])
+            } else {
+                ("./vendor/bin/phpunit", vec![])
+            }
+        }
         _ => {
             println!("No known test runner for extension '{}'. Please run tests manually.", ext);
             return Ok(());

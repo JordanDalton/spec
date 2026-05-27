@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub trait LlmProvider {
     fn complete(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error>>;
@@ -17,6 +17,18 @@ pub struct OpenAiProvider {
 pub struct OllamaProvider {
     pub host: String,
     pub model: String,
+}
+
+/// Uses the local `claude` CLI (Claude Code) instead of a direct API key.
+/// Runs within the user's existing Claude subscription — no ANTHROPIC_API_KEY required.
+pub struct ClaudeCodeProvider {
+    pub model: Option<String>,
+}
+
+/// Uses the local `codex` CLI (OpenAI Codex) instead of a direct API key.
+/// Runs within the user's existing OpenAI subscription — no OPENAI_API_KEY required.
+pub struct CodexProvider {
+    pub model: Option<String>,
 }
 
 impl AnthropicProvider {
@@ -161,6 +173,87 @@ impl LlmProvider for OllamaProvider {
     }
 }
 
+impl LlmProvider for ClaudeCodeProvider {
+    fn complete(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let mut args: Vec<String> = vec!["--print".to_string()];
+
+        if let Some(ref model) = self.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+
+        args.push(prompt.to_string());
+
+        let output = Command::new("claude")
+            .args(&args)
+            .output()
+            .map_err(|e| format!("Failed to run claude CLI: {}. Is Claude Code installed?", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("claude CLI failed: {}", stderr).into());
+        }
+
+        let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        if response.is_empty() {
+            return Err("claude CLI returned an empty response".into());
+        }
+
+        Ok(response)
+    }
+}
+
+impl LlmProvider for CodexProvider {
+    fn complete(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+        // Use a temp file to capture only the final agent message cleanly.
+        let tmp_path = std::env::temp_dir().join(format!("spec_codex_{}.txt", std::process::id()));
+
+        // --dangerously-bypass-approvals-and-sandbox is intentional here:
+        // spec sends pure text inference prompts — it never asks Codex to execute shell commands.
+        // When running inside a Codex session the parent sandbox already provides isolation,
+        // and nesting a second OS-level sandbox causes EPERM on macOS/Linux.
+        let mut args: Vec<String> = vec![
+            "exec".to_string(),
+            "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--output-last-message".to_string(),
+            tmp_path.to_string_lossy().into_owned(),
+        ];
+
+        if let Some(ref model) = self.model {
+            args.push("-m".to_string());
+            args.push(model.clone());
+        }
+
+        args.push(prompt.to_string());
+
+        let output = Command::new("codex")
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("Failed to run codex CLI: {}. Is Codex CLI installed?", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("codex exec failed: {}", stderr).into());
+        }
+
+        let response = std::fs::read_to_string(&tmp_path)
+            .map_err(|_| "codex ran but produced no output file — check codex is up to date")?;
+
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let trimmed = response.trim().to_string();
+        if trimmed.is_empty() {
+            return Err("codex returned an empty response".into());
+        }
+
+        Ok(trimmed)
+    }
+}
+
 /// Build an LLM provider from the project config.
 /// SPEC_PROVIDER and SPEC_API_KEY always take precedence over config file
 /// and provider-specific env vars, so Spec's keys never collide with the app's.
@@ -200,8 +293,20 @@ pub fn build_provider(
                 model: model.clone(),
             }))
         }
+        "claudecode" | "claude-code" => {
+            // Use the local claude CLI — no API key needed, runs on the user's Claude subscription.
+            // Only forward an explicit SPEC_MODEL override; otherwise let claude use its own default.
+            let explicit_model = std::env::var("SPEC_MODEL").ok();
+            Ok(Box::new(ClaudeCodeProvider { model: explicit_model }))
+        }
+        "codex" => {
+            // Use the local codex CLI — no API key needed, runs on the user's OpenAI subscription.
+            // Only forward an explicit SPEC_MODEL override; otherwise let codex use its own default.
+            let explicit_model = std::env::var("SPEC_MODEL").ok();
+            Ok(Box::new(CodexProvider { model: explicit_model }))
+        }
         other => Err(format!(
-            "Unknown provider '{}'. Set SPEC_PROVIDER to: anthropic, openai, ollama",
+            "Unknown provider '{}'. Set SPEC_PROVIDER to: anthropic, openai, ollama, claudecode, codex",
             other
         )
         .into()),

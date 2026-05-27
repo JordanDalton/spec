@@ -41,9 +41,19 @@ fn format_session_history(session: &Session) -> String {
                 .as_ref()
                 .map(|p| format!("\n  Proposal: {}", p.content))
                 .unwrap_or_default();
+            let knowledge_text = m
+                .knowledge
+                .as_ref()
+                .map(|k| format!("\n  Knowledge: {}", k))
+                .unwrap_or_default();
+            let context_text = m
+                .context
+                .as_ref()
+                .map(|c| format!("\n  Context: {}", c))
+                .unwrap_or_default();
             format!(
-                "[{}] {} | {}{}\n  Reasoning: {}",
-                m.timestamp, m.agent_id, m.message_type, proposal_text, m.reasoning
+                "[{}] {} | {}{}{}{}\n  Reasoning: {}",
+                m.timestamp, m.agent_id, m.message_type, knowledge_text, context_text, proposal_text, m.reasoning
             )
         })
         .collect::<Vec<_>>()
@@ -54,6 +64,7 @@ fn format_session_history(session: &Session) -> String {
 pub fn propose(
     file: &str,
     intent: &str,
+    knowledge: Option<&str>,
     provider: &dyn LlmProvider,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let agent_id = get_agent_id()?;
@@ -62,15 +73,61 @@ pub fn propose(
     // Read current spec state
     let spec_state = read_spec(file)?;
 
-    // Load session
-    let mut session = crate::session::load_or_create_session(file)?;
+    // Read the actual source file if it exists
+    let source_content = std::fs::read_to_string(file).ok();
+
+    // Load session snapshot for prompt building.
+    // If the session is locked, a new change cycle begins — use a clean snapshot.
+    let session = {
+        let s = crate::session::load_or_create_session(file)?;
+        if s.locked {
+            println!("Previous session is locked (consensus reached). Starting a new session.");
+            crate::session::Session::new(file)
+        } else {
+            s
+        }
+    };
+
+    // After a mediator intervention (clarify/reframe), agents must respond or concede —
+    // not add more proposals. New proposals are allowed only after the session locks.
+    if let Some(med_idx) = session.messages.iter()
+        .rposition(|m| matches!(m.message_type, MessageType::Clarify | MessageType::Reframe))
+    {
+        let med_type = &session.messages[med_idx].message_type;
+        return Err(format!(
+            "A mediator has run '{}' on this session. Use 'spec respond' or 'spec concede' \
+             to engage with the existing proposals — new proposals are blocked until consensus is reached.",
+            med_type
+        ).into());
+    }
+
+    // Prevent the same agent from proposing twice without a response from another agent
+    let already_proposed = session.messages.iter().any(|m| {
+        m.agent_id == agent_id && matches!(m.message_type, MessageType::Propose)
+    });
+    let other_responded = session.messages.iter().any(|m| {
+        m.agent_id != agent_id && matches!(m.message_type, MessageType::Respond | MessageType::Concede)
+    });
+    if already_proposed && !other_responded {
+        return Err(format!(
+            "Agent '{}' has already proposed. Wait for another agent to respond before proposing again.",
+            agent_id
+        ).into());
+    }
 
     // Query relevant lessons
     let lessons = memory::get_relevant_lessons(intent)?;
 
     // Build prompt
+    let source_section = match &source_content {
+        Some(src) => format!("Current source file ({}):\n{}", file, src),
+        None => format!("Current source file ({}): (does not exist yet)", file),
+    };
+
     let prompt = format!(
         r#"You are an AI agent participating in a spec-driven development process.
+
+{}
 
 Current spec file: {}
 
@@ -86,17 +143,24 @@ Relevant lessons from past sessions:
 User intent / change request:
 {}
 
-Your task: Propose a concrete change to the spec that fulfills the user's intent.
+Your task: Propose a concrete change to the source file that fulfills the user's intent.
+Apply ONLY the change described in the intent. Preserve everything else in the source file exactly as-is — existing comments, formatting, whitespace, unrelated methods, and structure must not be altered.
+
 Your response must include:
-1. PROPOSAL: The new or modified spec content (complete, not a diff)
-2. REASONING: Why this change is appropriate and how it fulfills the intent
+1. KNOWLEDGE: {}
+2. PROPOSAL: The complete updated file content (not a diff) with only the requested change applied
+3. REASONING: Why this change is appropriate and how it fulfills the intent
 
 Format your response as:
+KNOWLEDGE:
+{}
+
 PROPOSAL:
-<the full proposed spec content>
+<the full updated file content>
 
 REASONING:
 <your reasoning>"#,
+        source_section,
         file,
         if spec_state.content.is_empty() {
             "(empty - new spec)".to_string()
@@ -105,7 +169,13 @@ REASONING:
         },
         format_session_history(&session),
         format_lessons(&lessons),
-        intent
+        intent,
+        if knowledge.is_some() {
+            "The knowledge below was explicitly provided by the agent — use it verbatim, do not add to or alter it"
+        } else {
+            "The assumptions, constraints, and prior knowledge you are basing this proposal on — be explicit about what you know and what you are assuming"
+        },
+        knowledge.unwrap_or("<infer from the source file and intent>"),
     );
 
     println!("Querying LLM for proposal...");
@@ -113,29 +183,95 @@ REASONING:
 
     // Parse response
     let (proposal_content, reasoning) = parse_proposal_response(&response);
+    let knowledge = extract_section(&response, "KNOWLEDGE:")
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
 
     let proposal = SemanticProposal {
         content: proposal_content.clone(),
         spec_hash: Some(simple_hash(&proposal_content)),
     };
 
-    let msg = Message::new(
-        agent_id.clone(),
-        MessageType::Propose,
-        Some(proposal),
-        reasoning.clone(),
-        session.session_id.clone(),
-    );
-
+    if let Some(ref k) = knowledge {
+        println!("\n=== KNOWLEDGE by {} ===", agent_id);
+        println!("{}", k);
+    }
     println!("\n=== PROPOSAL by {} ===", agent_id);
     println!("{}", proposal_content);
     println!("\n=== REASONING ===");
     println!("{}", reasoning);
 
-    session.add_message(msg);
-    crate::session::save_session(&session)?;
+    // When running interactively (human at a terminal), confirm before committing.
+    // Automated agents pipe stdin so IsTerminal returns false — they auto-commit.
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        use std::io::Write;
+        print!("\nCommit this proposal? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        match input.trim().to_lowercase().as_str() {
+            "y" | "yes" => {}
+            _ => {
+                println!("Proposal discarded. Run 'spec propose' again to try a different intent.");
+                return Ok(());
+            }
+        }
+    }
 
-    println!("\nProposal recorded in session: {}", session.session_id);
+    let session_id = crate::session::with_session_lock(file, |session| {
+        // If the on-disk session is locked, archive it then reset — new change cycle.
+        // Archiving preserves history and keeps the .spec file available for parallel builds.
+        if session.locked {
+            crate::session::archive_session(file)?;
+            *session = crate::session::Session::new(file);
+        }
+
+        if let Some(med_idx) = session.messages.iter()
+            .rposition(|m| matches!(m.message_type, MessageType::Clarify | MessageType::Reframe))
+        {
+            let med_type = &session.messages[med_idx].message_type;
+            return Err(format!(
+                "A mediator has run '{}' on this session. Use 'spec respond' or 'spec concede' \
+                 to engage with the existing proposals — new proposals are blocked until consensus is reached.",
+                med_type
+            ).into());
+        }
+
+        let already_proposed = session.messages.iter().any(|m| {
+            m.agent_id == agent_id && matches!(m.message_type, MessageType::Propose)
+        });
+        let other_responded = session.messages.iter().any(|m| {
+            m.agent_id != agent_id && matches!(m.message_type, MessageType::Respond | MessageType::Concede)
+        });
+        if already_proposed && !other_responded {
+            return Err(format!(
+                "Agent '{}' has already proposed. Wait for another agent to respond before proposing again.",
+                agent_id
+            ).into());
+        }
+
+        // Build msg here so session_id matches the (possibly fresh) session.
+        let mut fresh_msg = Message::new(
+            agent_id.clone(),
+            MessageType::Propose,
+            Some(proposal),
+            reasoning.clone(),
+            session.session_id.clone(),
+        );
+        fresh_msg.knowledge = knowledge.clone();
+        session.add_message(fresh_msg);
+        Ok(session.session_id.clone())
+    })?;
+
+    println!("\nProposal recorded in session: {}", session_id);
+    println!("\nNext steps:");
+    println!("  Poll for a response:  spec state {}", file);
+    println!("  When another agent responds, either:");
+    println!("    spec agree {}     — sign off if you're satisfied", file);
+    println!("    spec concede {}   — update your position", file);
+    println!("  Or lock immediately:  spec agree {} --solo", file);
+    println!("\nSTATUS: WAITING_FOR_REPLY");
     Ok(())
 }
 
@@ -148,7 +284,7 @@ pub fn respond(
     println!("Agent [{}] responding to: {}", agent_id, file);
 
     let spec_state = read_spec(file)?;
-    let mut session = crate::session::load_or_create_session(file)?;
+    let session = crate::session::load_or_create_session(file)?;
 
     if session.messages.is_empty() {
         return Err("No proposals to respond to. Run 'spec propose' first.".into());
@@ -183,12 +319,13 @@ Full session history:
 Relevant lessons:
 {}
 
-Your task: Respond to the latest proposal. You may:
-- ACCEPT it (if you agree it's correct)
-- REJECT it with specific objections
-- SUGGEST modifications
+Your task: Respond to the latest proposal. Before taking a stance, you may provide additional
+context — new constraints, requirements, edge cases, or information the other agents should know.
 
 Format your response as:
+CONTEXT:
+<any new information you want to add to the session — leave blank if none>
+
 STANCE: [ACCEPT/REJECT/MODIFY]
 PROPOSAL:
 <if MODIFY, provide your modified version; if ACCEPT, repeat the proposal; if REJECT, explain in proposal field>
@@ -210,29 +347,44 @@ REASONING:
     let response = provider.complete(&prompt)?;
 
     let (proposal_content, reasoning) = parse_proposal_response(&response);
+    let context = extract_section(&response, "CONTEXT:")
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
 
     let proposal = SemanticProposal {
         content: proposal_content.clone(),
         spec_hash: Some(simple_hash(&proposal_content)),
     };
 
-    let msg = Message::new(
+    let mut msg = Message::new(
         agent_id.clone(),
         MessageType::Respond,
         Some(proposal),
         reasoning.clone(),
         session.session_id.clone(),
     );
+    msg.context = context.clone();
 
+    if let Some(ref ctx) = context {
+        println!("\n=== CONTEXT from {} ===", agent_id);
+        println!("{}", ctx);
+    }
     println!("\n=== RESPONSE by {} ===", agent_id);
     println!("{}", proposal_content);
     println!("\n=== REASONING ===");
     println!("{}", reasoning);
 
-    session.add_message(msg);
-    crate::session::save_session(&session)?;
+    let session_id = crate::session::with_session_lock(file, |session| {
+        session.add_message(msg);
+        Ok(session.session_id.clone())
+    })?;
 
-    println!("\nResponse recorded in session: {}", session.session_id);
+    println!("\nResponse recorded in session: {}", session_id);
+    println!("\nNext steps:");
+    println!("  Check the discussion:  spec log {}", file);
+    println!("  Sign off if satisfied: spec agree {}", file);
+    println!("  Update your position:  spec concede {}", file);
+    println!("\nSTATUS: WAITING_FOR_AGREE");
     Ok(())
 }
 
@@ -245,7 +397,7 @@ pub fn concede(
     println!("Agent [{}] conceding on: {}", agent_id, file);
 
     let spec_state = read_spec(file)?;
-    let mut session = crate::session::load_or_create_session(file)?;
+    let session = crate::session::load_or_create_session(file)?;
 
     if session.messages.is_empty() {
         return Err("No session to concede in. Run 'spec propose' first.".into());
@@ -314,23 +466,31 @@ REASONING:
     println!("\n=== REASONING ===");
     println!("{}", reasoning);
 
-    session.add_message(msg);
-    crate::session::save_session(&session)?;
+    let session_id = crate::session::with_session_lock(file, |session| {
+        session.add_message(msg);
+        Ok(session.session_id.clone())
+    })?;
 
-    println!("\nConcession recorded in session: {}", session.session_id);
+    println!("\nConcession recorded in session: {}", session_id);
+    println!("\nNext steps:");
+    println!("  Check the discussion:  spec log {}", file);
+    println!("  Sign off if satisfied: spec agree {}", file);
+    println!("  Respond if needed:     spec respond {}", file);
+    println!("\nSTATUS: WAITING_FOR_AGREE");
     Ok(())
 }
 
-/// `spec agree <file>` — agent signs off on the current spec state
+/// `spec agree <file> [--solo]` — agent signs off on the current spec state
 pub fn agree(
     file: &str,
+    solo: bool,
     provider: &dyn LlmProvider,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let agent_id = get_agent_id()?;
-    println!("Agent [{}] agreeing on: {}", agent_id, file);
+    println!("Agent [{}] agreeing on: {}{}", agent_id, file, if solo { " (solo)" } else { "" });
 
     let spec_state = read_spec(file)?;
-    let mut session = crate::session::load_or_create_session(file)?;
+    let session = crate::session::load_or_create_session(file)?;
 
     if session.locked {
         return Err("Session is already locked. Consensus has been reached.".into());
@@ -375,59 +535,87 @@ REASONING:
 
     let reasoning = extract_reasoning(&response);
 
-    // Use the latest proposal as the agreed content
-    let agreed_content = latest_proposal.unwrap_or_else(|| spec_state.content.clone());
+    // agreed_content from the snapshot (used as fallback inside the lock too)
+    let snapshot_agreed_content = latest_proposal.unwrap_or_else(|| spec_state.content.clone());
 
-    let proposal = SemanticProposal {
-        content: agreed_content.clone(),
-        spec_hash: Some(simple_hash(&agreed_content)),
-    };
-
-    let msg = Message::new(
-        agent_id.clone(),
-        MessageType::Agree,
-        Some(proposal),
-        reasoning.clone(),
-        session.session_id.clone(),
-    );
+    let spec_state_content = spec_state.content.clone();
 
     println!("\n=== AGREEMENT by {} ===", agent_id);
     println!("\n=== REASONING ===");
     println!("{}", reasoning);
 
-    session.add_message(msg);
+    // Acquire the lock to append and (if consensus) lock the session.
+    // Returns (locked, agreed_content, session_id, agents, agreed_count, total_count, single_agent).
+    type AgreeResult = (bool, String, String, Vec<String>, usize, usize, bool);
+    let (did_lock, agreed_content, session_id, agents_involved, agreed_count, total_count, single_agent): AgreeResult =
+        crate::session::with_session_lock(file, |session| {
+            if session.locked {
+                return Err("Session is already locked. Consensus has been reached.".into());
+            }
 
-    // Check if all agents have agreed
-    if session.all_agents_agreed() {
-        session.lock();
-        println!("\n*** CONSENSUS REACHED — Session locked ***");
+            // Re-derive agreed content from the freshest session state
+            let agreed_content = session
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.message_type, MessageType::Propose | MessageType::Respond | MessageType::Concede))
+                .and_then(|m| m.proposal.as_ref())
+                .map(|p| p.content.clone())
+                .unwrap_or_else(|| spec_state_content.clone());
 
-        // Write the new spec state
-        let new_state = SpecState::new(
-            agreed_content,
-            session.session_id.clone(),
-            session.agents_involved(),
-        );
+            let proposal = SemanticProposal {
+                content: agreed_content.clone(),
+                spec_hash: Some(simple_hash(&agreed_content)),
+            };
+
+            let msg = Message::new(
+                agent_id.clone(),
+                MessageType::Agree,
+                Some(proposal),
+                reasoning.clone(),
+                session.session_id.clone(),
+            );
+
+            session.add_message(msg);
+
+            let should_lock = solo || session.all_agents_agreed();
+            if should_lock {
+                if solo { session.solo = true; }
+                session.lock();
+            }
+
+            let agents = session.agents_involved();
+            let agreed = session.agreed_agents.len();
+            let total = agents.len();
+            let single = session.participating_agent_count() < 2;
+
+            Ok((should_lock, agreed_content, session.session_id.clone(), agents, agreed, total, single))
+        })?;
+
+    if did_lock {
+        println!("\n*** {} — Session locked ***",
+            if solo { "SOLO AGREEMENT" } else { "CONSENSUS REACHED" });
+
+        let new_state = SpecState::new(agreed_content, session_id.clone(), agents_involved);
         write_spec(file, &new_state)?;
         println!("Spec state updated and locked: {}", file);
 
         run_hook("post-agree", &HookContext {
             spec_file: file.to_string(),
-            session_id: Some(session.session_id.clone()),
+            session_id: Some(session_id),
             env_target: None,
         })?;
+    } else if single_agent {
+        println!("\nAgreement recorded. Waiting for at least one other agent to participate before consensus can lock.");
+        println!("Have another agent run: SPEC_AGENT_ID=<other> spec respond {}", file);
+        println!("Or lock immediately with: spec agree {} --solo", file);
+        println!("\nSTATUS: WAITING_FOR_REPLY");
     } else {
-        let agreed = session.agreed_agents.len();
-        let total = session.agents_involved().len();
-        if session.participating_agent_count() < 2 {
-            println!("\nAgreement recorded. Waiting for at least one other agent to participate before consensus can lock.");
-            println!("Have another agent run: SPEC_AGENT_ID=<other> spec respond {}", file);
-        } else {
-            println!("\nAgreement recorded ({}/{} agents agreed)", agreed, total);
-        }
+        println!("\nAgreement recorded ({}/{} agents agreed)", agreed_count, total_count);
+        println!("\nSTATUS: WAITING_FOR_AGREE");
     }
 
-    crate::session::save_session(&session)?;
+    let _ = snapshot_agreed_content;
     Ok(())
 }
 
@@ -462,7 +650,7 @@ fn extract_reasoning(text: &str) -> String {
 }
 
 fn find_next_section(text: &str) -> usize {
-    let section_markers = ["PROPOSAL:", "REASONING:", "STANCE:", "CONCESSION:", "UPDATED PROPOSAL:", "AGREEMENT:"];
+    let section_markers = ["KNOWLEDGE:", "PROPOSAL:", "REASONING:", "STANCE:", "CONCESSION:", "UPDATED PROPOSAL:", "AGREEMENT:", "CONTEXT:"];
     let mut min_idx = text.len();
     let lower = text.to_lowercase();
     for marker in &section_markers {
